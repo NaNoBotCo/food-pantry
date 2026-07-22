@@ -1,0 +1,91 @@
+import pytesseract
+from PIL import Image
+import cv2
+import os
+import re
+import pandas as pd
+from dateutil import parser
+
+INPUT_DIR = "intake_pngs"
+OUTPUT_FILE = "output.csv"
+
+def preprocess_image(path):
+    img = cv2.imread(path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+    return thresh
+
+def extract_text(img_array):
+    return pytesseract.image_to_string(img_array)
+
+def _match(pattern, text):
+    match = re.search(pattern, text, re.IGNORECASE)
+    return match.group(1).strip() if match else None
+
+def safe_name(raw):
+    return raw.strip().split("\n")[0][:60] if raw else None
+
+def safe_parse_date(raw):
+    if not raw:
+        return None
+    try:
+        return parser.parse(raw, fuzzy=True, default=None).strftime("%Y-%m-%d")
+    except:
+        return None
+
+def _box_check(label, text):
+    pattern = rf"([X✓x])\s*{label}"
+    return bool(re.search(pattern, text, re.IGNORECASE))
+
+def parse_fields(text, filename):
+    name_raw = _match(r"Name:\s*(.+)", text)
+    dob_raw = _match(r"Date of Birth:\s*(.+)", text)
+
+    fields = {
+        "Source": filename,
+        "Name": safe_name(name_raw),
+        "DOB": safe_parse_date(dob_raw),
+        "Email": _match(r"Email\*?:\s*([^\s]+@[^\s]+)", text),
+        "Phone": _match(r"Phone:\s*(\(?\d{3}\)?[\s\-]?\d{3}[\-]?\d{4})", text),
+        "City": _match(r"City\s*:?\s*([A-Za-z\s]+)", text),
+        "Race_White": _box_check("White", text),
+        "Ethnicity_Not_Hispanic": _box_check("Not Hispanic", text),
+    }
+
+    text_wordcount = len(text.split())
+    fields["WordCount"] = text_wordcount
+
+    # Chaos discard filter
+    fields["LikelyValid"] = (
+        fields["Name"] is not None and
+        fields["DOB"] is not None and
+        text_wordcount > 40
+    )
+
+    return fields
+
+def main():
+    rows = []
+    for filename in sorted(os.listdir(INPUT_DIR)):
+        if not filename.endswith(".png"):
+            continue
+        print(f"📄 Processing: {filename}")
+        path = os.path.join(INPUT_DIR, filename)
+        img_array = preprocess_image(path)
+        text = extract_text(img_array)
+        fields = parse_fields(text, filename)
+
+        if fields["LikelyValid"]:
+            rows.append(fields)
+        else:
+            print(f"⚠️  Skipped low-quality or malformed: {filename}")
+
+    if rows:
+        df = pd.DataFrame(rows)
+        df.to_csv(OUTPUT_FILE, index=False)
+        print(f"✅ Done. {len(rows)} rows saved to {OUTPUT_FILE}")
+    else:
+        print("❌ No valid rows found.")
+
+if __name__ == "__main__":
+    main()
